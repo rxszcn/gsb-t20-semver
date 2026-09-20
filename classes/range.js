@@ -53,13 +53,13 @@ class Range {
     if (this.set.length > 1) {
       // keep the first one, in case they're all null sets
       const first = this.set[0]
-      this.set = this.set.filter(c => !isNullSet(c[0]))
+      this.set = this.set.filter(c => !isNullComparator(c[0]))
       if (this.set.length === 0) {
         this.set = [first]
       } else if (this.set.length > 1) {
         // if we have any that are *, then the range is just *
         for (const c of this.set) {
-          if (c.length === 1 && isAny(c[0])) {
+          if (c.length === 1 && isAnyComparator(c[0])) {
             this.set = [c]
             break
           }
@@ -156,7 +156,7 @@ class Range {
     const rangeMap = new Map()
     const comparators = rangeList.map(comp => new Comparator(comp, this.options))
     for (const comp of comparators) {
-      if (isNullSet(comp)) {
+      if (isNullComparator(comp)) {
         return [comp]
       }
       rangeMap.set(comp.value, comp)
@@ -233,30 +233,196 @@ const {
   caretTrimReplace,
 } = require('../internal/re')
 const { FLAG_INCLUDE_PRERELEASE, FLAG_LOOSE } = require('../internal/constants')
+const compare = require('../functions/compare')
+const cmp = require('../functions/cmp')
 
 // unbounded global build-metadata stripper used by parseRange
 const BUILDSTRIPRE = new RegExp(src[t.BUILD], 'g')
 
-const isNullSet = c => c.value === '<0.0.0-0'
-const isAny = c => c.value === ''
+// Shared determination of what a simple comparator set (one entry in
+// Range#set, ie the AND of its comparators) denotes: whether it is the
+// empty set of versions, or the full set of all versions.
+//
+// minVersion, intersects (via isSatisfiable), and subset all use these
+// predicates, so that they always agree on which ranges are empty and
+// which ranges impose no constraint at all.
+
+// The canonical null-set comparator, produced by things like `>x`
+const isNullComparator = c => c.value === '<0.0.0-0'
+
+// The canonical "any version" comparator, produced by things like `*`
+const isAnyComparator = c => c.value === ''
+
+// A simple set matches every version iff none of its comparators
+// forbid anything.
+const isAnySet = comparators => comparators.every(isAnyComparator)
+
+// >=1.2.3 is lower than >1.2.3
+const higherGT = (a, b, options) => {
+  if (!a) {
+    return b
+  }
+  const comp = compare(a.semver, b.semver, options)
+  return comp > 0 ? a
+    : comp < 0 ? b
+    : b.operator === '>' && a.operator === '>=' ? b
+    : a
+}
+
+// <=1.2.3 is higher than <1.2.3
+const lowerLT = (a, b, options) => {
+  if (!a) {
+    return b
+  }
+  const comp = compare(a.semver, b.semver, options)
+  return comp < 0 ? a
+    : comp > 0 ? b
+    : b.operator === '<' && a.operator === '<=' ? b
+    : a
+}
+
+// The version immediately following a version: for a prerelease, the
+// same tuple with `.0` appended (1.2.3-0 -> 1.2.3-0.0); for a release,
+// the lowest prerelease of the next patch (1.2.3 -> 1.2.4-0).
+const isImmediateSuccessor = (a, b) => {
+  if (a.major !== b.major || a.minor !== b.minor) {
+    return false
+  }
+  if (a.prerelease.length) {
+    return a.patch === b.patch &&
+      b.prerelease.length === a.prerelease.length + 1 &&
+      a.prerelease.every((id, i) => id === b.prerelease[i]) &&
+      b.prerelease[b.prerelease.length - 1] === 0
+  }
+  return a.patch + 1 === b.patch &&
+    b.prerelease.length === 1 &&
+    b.prerelease[0] === 0
+}
+
+// The lowest release (non-prerelease) version allowed by a > or >=
+// comparator.  A release always follows its own prereleases, so for
+// prerelease bounds (and for inclusive bounds) it is the bound's tuple.
+const releaseFloor = (gt) => {
+  const { major, minor, patch, prerelease } = gt.semver
+  if (prerelease.length || gt.operator === '>=') {
+    return `${major}.${minor}.${patch}`
+  }
+  return `${major}.${minor}.${patch + 1}`
+}
+
+// In non-prerelease mode a prerelease version only counts when some
+// comparator mentions its major.minor.patch tuple with a prerelease of
+// its own, which whitelists that tuple's prerelease band [T-0, T).
+// Does such a comparator's band reach between the bounds?
+const bandIntersects = (comparator, gt, lt, options) => {
+  const { major, minor, patch } = comparator.semver
+  const bandLow = `${major}.${minor}.${patch}-0`
+  const bandHigh = `${major}.${minor}.${patch}`
+
+  // the higher of the band floor and the lower bound
+  let loVer = bandLow
+  let loIncl = true
+  if (gt && !cmp(bandLow, gt.operator, gt.semver, options)) {
+    loVer = gt.semver
+    loIncl = gt.operator === '>='
+  }
+
+  // the lower of the band ceiling (exclusive) and the upper bound
+  let hiVer = bandHigh
+  let hiIncl = false
+  if (lt) {
+    const ltVsHigh = compare(lt.semver, bandHigh, options)
+    if (ltVsHigh < 0 || (ltVsHigh === 0 && lt.operator === '<')) {
+      hiVer = lt.semver
+      hiIncl = lt.operator === '<='
+    }
+  }
+
+  const loHi = compare(loVer, hiVer, options)
+  return loHi < 0 || (loHi === 0 && loIncl && hiIncl)
+}
+
+// A simple set is the null set iff no version can satisfy all of its
+// comparators at once.
+const isNullSet = (comparators, options) => {
+  let eq = null
+  let gt = null
+  let lt = null
+  for (const c of comparators) {
+    if (isNullComparator(c)) {
+      return true
+    }
+    if (isAnyComparator(c)) {
+      continue
+    }
+    if (c.operator === '>' || c.operator === '>=') {
+      gt = higherGT(gt, c, options)
+    } else if (c.operator === '<' || c.operator === '<=') {
+      lt = lowerLT(lt, c, options)
+    } else if (!eq) {
+      eq = c.semver
+    } else if (compare(eq, c.semver, options) !== 0) {
+      // two different exact versions can never both be satisfied
+      return true
+    }
+  }
+
+  if (eq) {
+    // A lone exact version is only null when a bound rules it out.  Its
+    // own comparator always whitelists its prerelease tuple, so plain
+    // comparison against the bounds is exact here.
+    return Boolean(
+      (gt && !cmp(eq, gt.operator, gt.semver, options)) ||
+      (lt && !cmp(eq, lt.operator, lt.semver, options)))
+  }
+
+  if (gt && lt) {
+    const gtltComp = compare(gt.semver, lt.semver, options)
+    if (gtltComp > 0) {
+      return true
+    }
+    if (gtltComp === 0) {
+      // only the shared boundary version could possibly qualify
+      return gt.operator !== '>=' || lt.operator !== '<='
+    }
+    if (gt.operator === '>' && lt.operator === '<' &&
+        isImmediateSuccessor(gt.semver, lt.semver)) {
+      // exclusive bounds with nothing in between, eg `>1.2.3 <1.2.4-0`
+      return true
+    }
+  }
+
+  // From here on the bounds admit a nonempty interval of versions.
+  // That settles it in prerelease mode; otherwise a version only
+  // counts if it is a release, or a prerelease whose tuple some
+  // comparator explicitly whitelists.
+  const floor = gt ? releaseFloor(gt) : '0.0.0'
+  if (!lt || cmp(floor, lt.operator, lt.semver, options)) {
+    return false
+  }
+  if (options && options.includePrerelease) {
+    return false
+  }
+  for (const c of comparators) {
+    if (!isAnyComparator(c) && c.semver.prerelease.length &&
+        bandIntersects(c, gt, lt, options)) {
+      return false
+    }
+  }
+  return true
+}
 
 // take a set of comparators and determine whether there
 // exists a version which can satisfy it
-const isSatisfiable = (comparators, options) => {
-  let result = true
-  const remainingComparators = comparators.slice()
-  let testComparator = remainingComparators.pop()
+const isSatisfiable = (comparators, options) =>
+  !isNullSet(comparators, options)
 
-  while (result && remainingComparators.length) {
-    result = remainingComparators.every((otherComparator) => {
-      return testComparator.intersects(otherComparator, options)
-    })
-
-    testComparator = remainingComparators.pop()
-  }
-
-  return result
-}
+// shared with minVersion and subset, so that all of the places that
+// reason about empty or universal ranges agree on the answer
+Range.isNullSet = isNullSet
+Range.isAnySet = isAnySet
+Range.higherGT = higherGT
+Range.lowerLT = lowerLT
 
 // comprised of xranges, tildes, stars, and gtlt's at this point.
 // already replaced the hyphen ranges
