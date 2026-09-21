@@ -59,7 +59,7 @@ class Range {
       } else if (this.set.length > 1) {
         // if we have any that are *, then the range is just *
         for (const c of this.set) {
-          if (c.length === 1 && isAny(c[0])) {
+          if (isUniversal(c)) {
             this.set = [c]
             break
           }
@@ -233,30 +233,164 @@ const {
   caretTrimReplace,
 } = require('../internal/re')
 const { FLAG_INCLUDE_PRERELEASE, FLAG_LOOSE } = require('../internal/constants')
+const compare = require('../functions/compare')
 
 // unbounded global build-metadata stripper used by parseRange
 const BUILDSTRIPRE = new RegExp(src[t.BUILD], 'g')
 
+// The single source of truth for what a simple comparator set (one
+// entry in Range.set) means: whether it is the null set, whether it
+// is the universal set, and whether any version can satisfy it.
+// Range (parsing and intersects), subset, and minVersion all get
+// their emptiness/universality answers from here, so that they can
+// never disagree about them.
+
+// The null set marker.  Nothing is less than 0.0.0-0, and parseRange
+// collapses any comparator list containing this to just this
+// comparator, since no version can satisfy it.
 const isNullSet = c => c.value === '<0.0.0-0'
+
+// The ANY comparator: `*`, `x`, and the empty string all parse to
+// this, and it excludes nothing.
 const isAny = c => c.value === ''
 
-// take a set of comparators and determine whether there
-// exists a version which can satisfy it
+// A simple comparator set is the universal set iff it is only the
+// ANY comparator.
+const isUniversal = comparators =>
+  comparators.length === 1 && isAny(comparators[0])
+
+// >=1.2.3 is lower than >1.2.3
+const higherGT = (a, b, options) => {
+  if (!a) {
+    return b
+  }
+  const comp = compare(a.semver, b.semver, options)
+  return comp > 0 ? a
+    : comp < 0 ? b
+    : b.operator === '>' && a.operator === '>=' ? b
+    : a
+}
+
+// <=1.2.3 is higher than <1.2.3
+const lowerLT = (a, b, options) => {
+  if (!a) {
+    return b
+  }
+  const comp = compare(a.semver, b.semver, options)
+  return comp < 0 ? a
+    : comp > 0 ? b
+    : b.operator === '<' && a.operator === '<=' ? b
+    : a
+}
+
+// The least versions that could satisfy a `>` comparator: the
+// immediate successors of its version.  >1.2.3-0 starts at
+// 1.2.3-0.0.  >1.2.3 starts at 1.2.4-0, or at 1.2.4 if this set
+// does not allow prereleases of the 1.2.4 tuple.
+const exclusiveSuccessors = (semver) => {
+  if (semver.prerelease.length) {
+    return [new SemVer(`${semver.version}.0`)]
+  }
+  const next = `${semver.major}.${semver.minor}.${semver.patch + 1}`
+  return [new SemVer(`${next}-0`), new SemVer(next)]
+}
+
+// Like Range.test() for a single simple set: every comparator must
+// pass, and a prerelease version needs a comparator that opts its
+// tuple into prereleases.
+const testComparators = (comparators, version, options) => {
+  for (const c of comparators) {
+    if (!c.test(version)) {
+      return false
+    }
+  }
+  if (!version.prerelease.length || (options && options.includePrerelease)) {
+    return true
+  }
+  for (const c of comparators) {
+    if (isAny(c)) {
+      continue
+    }
+    const allowed = c.semver
+    if (allowed.prerelease.length &&
+        allowed.major === version.major &&
+        allowed.minor === version.minor &&
+        allowed.patch === version.patch) {
+      return true
+    }
+  }
+  return false
+}
+
+// Take a set of comparators and determine whether there exists a
+// version which can satisfy it.  A simple set is the null set iff
+// this returns false.
 const isSatisfiable = (comparators, options) => {
-  let result = true
-  const remainingComparators = comparators.slice()
-  let testComparator = remainingComparators.pop()
-
-  while (result && remainingComparators.length) {
-    result = remainingComparators.every((otherComparator) => {
-      return testComparator.intersects(otherComparator, options)
-    })
-
-    testComparator = remainingComparators.pop()
+  let gt, lt
+  const eqSet = new Set()
+  for (const c of comparators) {
+    if (isNullSet(c)) {
+      return false
+    }
+    if (isAny(c)) {
+      continue
+    }
+    if (c.operator === '>' || c.operator === '>=') {
+      gt = higherGT(gt, c, options)
+    } else if (c.operator === '<' || c.operator === '<=') {
+      lt = lowerLT(lt, c, options)
+    } else {
+      eqSet.add(c.semver)
+    }
   }
 
-  return result
+  // more than one distinct = version: nothing can be both
+  if (eqSet.size > 1) {
+    return false
+  }
+
+  if (gt && lt) {
+    const gtltComp = compare(gt.semver, lt.semver, options)
+    // >2 <1 and such are the null set
+    if (gtltComp > 0) {
+      return false
+    }
+    // >=x <=x is exactly x, anything else touching at x is the null set
+    if (gtltComp === 0 && (gt.operator !== '>=' || lt.operator !== '<=')) {
+      return false
+    }
+  }
+
+  // The least version this set could contain: an = version, the
+  // highest lower bound (stepped past an exclusive one), or the
+  // floor of the version space when there is no lower bound.  If no
+  // candidate satisfies every comparator, neither can anything
+  // higher, so the set is the null set.
+  const candidates = []
+  for (const eq of eqSet) {
+    candidates.push(eq)
+  }
+  if (candidates.length === 0) {
+    if (gt) {
+      if (gt.operator === '>=') {
+        candidates.push(gt.semver)
+      } else {
+        candidates.push(...exclusiveSuccessors(gt.semver))
+      }
+    } else {
+      candidates.push(new SemVer('0.0.0-0'), new SemVer('0.0.0'))
+    }
+  }
+
+  return candidates.some(v => testComparators(comparators, v, options))
 }
+
+// share the one determination with subset and minVersion
+Range.isNullSet = isNullSet
+Range.isUniversal = isUniversal
+Range.isSatisfiable = isSatisfiable
+Range.higherGT = higherGT
+Range.lowerLT = lowerLT
 
 // comprised of xranges, tildes, stars, and gtlt's at this point.
 // already replaced the hyphen ranges

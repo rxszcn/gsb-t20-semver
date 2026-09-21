@@ -3,6 +3,7 @@
 const SemVer = require('../classes/semver')
 const Range = require('../classes/range')
 const gt = require('../functions/gt')
+const { isSatisfiable } = Range
 
 const minVersion = (range, loose) => {
   range = new Range(range, loose)
@@ -20,6 +21,12 @@ const minVersion = (range, loose) => {
   minver = null
   for (let i = 0; i < range.set.length; ++i) {
     const comparators = range.set[i]
+
+    // a null simple range has no minimum and contributes nothing,
+    // same determination as intersects and subset
+    if (!isSatisfiable(comparators, range.options)) {
+      continue
+    }
 
     let setMin = null
     comparators.forEach((comparator) => {

@@ -81,9 +81,22 @@ class Comparator {
       throw new TypeError('a Comparator is required')
     }
 
+    // the null set intersects nothing, same determination as
+    // Range.intersects, subset, and minVersion
+    if (!Range.isSatisfiable([this], options) ||
+        !Range.isSatisfiable([comp], options)) {
+      return false
+    }
+
     if (this.operator === '') {
       if (this.value === '') {
-        return true
+        if (comp.value === '') {
+          return true
+        }
+        // the universal comparator still only intersects an exact
+        // version if that version passes the universal range
+        return comp.operator !== '' ||
+          new Range(this.value, options).test(comp.semver)
       }
       return new Range(comp.value, options).test(this.value)
     } else if (comp.operator === '') {
@@ -94,16 +107,6 @@ class Comparator {
     }
 
     options = parseOptions(options)
-
-    // Special cases where nothing can possibly be lower
-    if (options.includePrerelease &&
-      (this.value === '<0.0.0-0' || comp.value === '<0.0.0-0')) {
-      return false
-    }
-    if (!options.includePrerelease &&
-      (this.value.startsWith('<0.0.0') || comp.value.startsWith('<0.0.0'))) {
-      return false
-    }
 
     // Same direction increasing (> or >=)
     if (this.operator.startsWith('>') && comp.operator.startsWith('>')) {

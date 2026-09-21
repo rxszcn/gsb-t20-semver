@@ -2,14 +2,24 @@
 
 const Range = require('../classes/range.js')
 const Comparator = require('../classes/comparator.js')
-const { ANY } = Comparator
 const satisfies = require('../functions/satisfies.js')
 const compare = require('../functions/compare.js')
+const {
+  higherGT,
+  lowerLT,
+  isSatisfiable,
+  isUniversal,
+} = Range
 
 // Complex range `r1 || r2 || ...` is a subset of `R1 || R2 || ...` iff:
-// - Every simple range `r1, r2, ...` is a null set, OR
-// - Every simple range `r1, r2, ...` which is not a null set is a subset of
-//   some `R1, R2, ...`
+// - Every simple range `r1, r2, ...` is the null set, OR
+// - Every simple range `r1, r2, ...` which is not the null set is a
+//   subset of some `R1, R2, ...`
+//
+// Whether a simple range is the null set (no version can satisfy it)
+// or the universal set (only the ANY comparator) is determined once,
+// in classes/range.js, shared with Range.intersects and minVersion,
+// so they cannot disagree.
 //
 // Simple range `c1 c2 ...` is a subset of simple range `C1 C2 ...` iff:
 // - If c is only the ANY comparator
@@ -20,14 +30,10 @@ const compare = require('../functions/compare.js')
 //   - if in prerelease mode, return true
 //   - else replace C with `[>=0.0.0]`
 // - Let EQ be the set of = comparators in c
-// - If EQ is more than one, return true (null set)
 // - Let GT be the highest > or >= comparator in c
 // - Let LT be the lowest < or <= comparator in c
-// - If GT and LT, and GT.semver > LT.semver, return true (null set)
 // - If any C is a = range, and GT or LT are set, return false
 // - If EQ
-//   - If GT, and EQ does not satisfy GT, return true (null set)
-//   - If LT, and EQ does not satisfy LT, return true (null set)
 //   - If EQ satisfies every C, return true
 //   - Else return false
 // - If GT
@@ -49,23 +55,20 @@ const subset = (sub, dom, options = {}) => {
 
   sub = new Range(sub, options)
   dom = new Range(dom, options)
-  let sawNonNull = false
 
   OUTER: for (const simpleSub of sub.set) {
+    // the null set is a subset of everything, and null simple ranges
+    // in a complex range are ignored, so only simple ranges that can
+    // be satisfied need to find a home in the dom.
+    if (!isSatisfiable(simpleSub, options)) {
+      continue
+    }
     for (const simpleDom of dom.set) {
-      const isSub = simpleSubset(simpleSub, simpleDom, options)
-      sawNonNull = sawNonNull || isSub !== null
-      if (isSub) {
+      if (simpleSubset(simpleSub, simpleDom, options)) {
         continue OUTER
       }
     }
-    // the null set is a subset of everything, but null simple ranges in
-    // a complex range should be ignored.  so if we saw a non-null range,
-    // then we know this isn't a subset, but if EVERY simple range was null,
-    // then it is a subset.
-    if (sawNonNull) {
-      return false
-    }
+    return false
   }
   return true
 }
@@ -74,12 +77,8 @@ const minimumVersionWithPreRelease = [new Comparator('>=0.0.0-0')]
 const minimumVersion = [new Comparator('>=0.0.0')]
 
 const simpleSubset = (sub, dom, options) => {
-  if (sub === dom) {
-    return true
-  }
-
-  if (sub.length === 1 && sub[0].semver === ANY) {
-    if (dom.length === 1 && dom[0].semver === ANY) {
+  if (isUniversal(sub)) {
+    if (isUniversal(dom)) {
       return true
     } else if (options.includePrerelease) {
       sub = minimumVersionWithPreRelease
@@ -88,7 +87,7 @@ const simpleSubset = (sub, dom, options) => {
     }
   }
 
-  if (dom.length === 1 && dom[0].semver === ANY) {
+  if (isUniversal(dom)) {
     if (options.includePrerelease) {
       return true
     } else {
@@ -108,30 +107,13 @@ const simpleSubset = (sub, dom, options) => {
     }
   }
 
-  if (eqSet.size > 1) {
-    return null
-  }
-
   let gtltComp
   if (gt && lt) {
     gtltComp = compare(gt.semver, lt.semver, options)
-    if (gtltComp > 0) {
-      return null
-    } else if (gtltComp === 0 && (gt.operator !== '>=' || lt.operator !== '<=')) {
-      return null
-    }
   }
 
   // will iterate one or zero times
   for (const eq of eqSet) {
-    if (gt && !satisfies(eq, String(gt), options)) {
-      return null
-    }
-
-    if (lt && !satisfies(eq, String(lt), options)) {
-      return null
-    }
-
     for (const c of dom) {
       if (!satisfies(eq, String(c), options)) {
         return false
@@ -220,30 +202,6 @@ const simpleSubset = (sub, dom, options) => {
   }
 
   return true
-}
-
-// >=1.2.3 is lower than >1.2.3
-const higherGT = (a, b, options) => {
-  if (!a) {
-    return b
-  }
-  const comp = compare(a.semver, b.semver, options)
-  return comp > 0 ? a
-    : comp < 0 ? b
-    : b.operator === '>' && a.operator === '>=' ? b
-    : a
-}
-
-// <=1.2.3 is higher than <1.2.3
-const lowerLT = (a, b, options) => {
-  if (!a) {
-    return b
-  }
-  const comp = compare(a.semver, b.semver, options)
-  return comp < 0 ? a
-    : comp > 0 ? b
-    : b.operator === '<' && a.operator === '<=' ? b
-    : a
 }
 
 module.exports = subset
